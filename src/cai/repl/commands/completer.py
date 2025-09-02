@@ -30,6 +30,7 @@ from cai.repl.commands.base import (
     COMMANDS,
     COMMAND_ALIASES
 )
+from cai.repl.commands.model import get_predefined_model_names
 
 console = Console()
 
@@ -51,6 +52,7 @@ class FuzzyCommandCompleter(Completer):
     - Autocompletion menu with descriptions
     - Command shadowing (showing hints for previously used commands)
     - Model completion for the /model command
+    - Agent completion for the /agent command
     """
 
     # Class-level cache for models
@@ -59,14 +61,26 @@ class FuzzyCommandCompleter(Completer):
     _last_model_fetch = datetime.datetime.now() - datetime.timedelta(minutes=10)
     _fetch_lock = threading.Lock()
 
+    # Class-level cache for agents (with proper threading and time-based caching)
+    _cached_agents = []
+    _cached_agent_numbers = {}
+    _last_agent_fetch = datetime.datetime.now() - datetime.timedelta(minutes=10)
+    _agent_fetch_lock = threading.Lock()
+    
     def __init__(self):
-        """Initialize the command completer with cached model information."""
+        """Initialize the command completer with cached model and agent information."""
         super().__init__()
         self.command_history = {}  # Store command usage frequency
         
         # Fetch models in background thread to avoid blocking
         threading.Thread(
             target=self._background_fetch_models,
+            daemon=True
+        ).start()
+
+        # Fetch agents in background thread to avoid blocking
+        threading.Thread(
+            target=self._background_fetch_agents,
             daemon=True
         ).start()
 
@@ -79,15 +93,63 @@ class FuzzyCommandCompleter(Completer):
             'scrollbar.button': 'bg:#004b6b',
         })
     
+    def _background_fetch_agents(self):
+        """Fetch agents in background to avoid blocking the UI."""
+        try:
+            self.fetch_all_agents()
+        except Exception:  # pylint: disable=broad-except
+            # Silently fail if agent fetching is not available
+            pass
+
+    def fetch_all_agents(self):
+        """Fetch all available agents to match /agent command."""
+        # Only fetch every 60 seconds to avoid excessive calls
+        now = datetime.datetime.now()
+        
+        # Use a lock to prevent multiple threads from fetching simultaneously
+        with self._agent_fetch_lock:
+            if (now - self._last_agent_fetch).total_seconds() < 60:
+                return
+            
+            self._last_agent_fetch = now
+            
+            try:
+                from cai.agents import get_available_agents
+                
+                # Get agents and filter out parallel patterns (like /agent list does)
+                all_agents = get_available_agents()
+                regular_agents = []
+                
+                for agent_key, agent in all_agents.items():
+                    # Skip parallel patterns in completion (matches /agent list behavior)
+                    if hasattr(agent, "_pattern"):
+                        pattern = agent._pattern
+                        if hasattr(pattern, "type"):
+                            pattern_type_value = getattr(pattern.type, 'value', str(pattern.type))
+                            if pattern_type_value == "parallel":
+                                continue
+                    regular_agents.append(agent_key)
+                
+                self._cached_agents = regular_agents
+                
+                # Create number mappings (1-based indexing)
+                self._cached_agent_numbers = {}
+                for i, agent_key in enumerate(self._cached_agents, 1):
+                    self._cached_agent_numbers[str(i)] = agent_key
+                    
+            except Exception:  # pylint: disable=broad-except
+                # Silently fail if agent fetching is not available
+                pass
+    
     def _background_fetch_models(self):
         """Fetch models in background to avoid blocking the UI."""
         try:
-            self.fetch_ollama_models()
+            self.fetch_all_models()
         except Exception:  # pylint: disable=broad-except
             pass
 
-    def fetch_ollama_models(self):  # pylint: disable=too-many-branches,too-many-statements,inconsistent-return-statements,line-too-long # noqa: E501
-        """Fetch available models from Ollama if it's running."""
+    def fetch_all_models(self):  # pylint: disable=too-many-branches,too-many-statements,inconsistent-return-statements,line-too-long # noqa: E501
+        """Fetch all available models (predefined + LiteLLM + Ollama) to match /model command."""
         # Only fetch every 60 seconds to avoid excessive API calls
         now = datetime.datetime.now()
         
@@ -97,8 +159,28 @@ class FuzzyCommandCompleter(Completer):
                 return
             
             self._last_model_fetch = now
-            ollama_models = []
+            
+            # Start with predefined models from the shared source of truth
+            all_models = get_predefined_model_names()
 
+            # Fetch LiteLLM models (matches the /model command behavior)
+            try:
+                litellm_url = (
+                    "https://raw.githubusercontent.com/BerriAI/litellm/main/"
+                    "model_prices_and_context_window.json"
+                )
+                response = requests.get(litellm_url, timeout=2)
+                
+                if response.status_code == 200:
+                    litellm_data = response.json()
+                    # Add LiteLLM models (sorted for consistency)
+                    litellm_models = sorted(litellm_data.keys())
+                    all_models.extend(litellm_models)
+            except Exception:  # pylint: disable=broad-except
+                # Silently fail if LiteLLM is not available
+                pass
+
+            # Fetch Ollama models
             try:
                 # Get Ollama models with a short timeout to prevent hanging
                 api_base = get_ollama_api_base()
@@ -113,47 +195,17 @@ class FuzzyCommandCompleter(Completer):
                         # Fallback for older Ollama versions
                         models = data.get('items', [])
 
-                    ollama_models = [(model.get('name', ''), []) for model in models]
+                    ollama_models = [model.get('name', '') for model in models]
+                    all_models.extend(ollama_models)
             except Exception:  # pylint: disable=broad-except
                 # Silently fail if Ollama is not available
                 pass
 
-            # Standard models always available
-            standard_models = [
-                # Alias models
-                "alias0",
-
-                # Claude 3.7 models
-                "claude-3-7-sonnet-20250219",
-
-                # Claude 3.5 models
-                "claude-3-5-sonnet-20240620",
-                "claude-3-5-20241122",
-
-                # Claude 3 models
-                "claude-3-opus-20240229",
-                "claude-3-sonnet-20240229",
-                "claude-3-haiku-20240307",
-
-                # OpenAI O-series models
-                "o1",
-                "o1-mini",
-                "o3-mini",
-
-                # OpenAI GPT models
-                "gpt-4o",
-                "gpt-4-turbo",
-                "gpt-3.5-turbo",
-
-                # DeepSeek models
-                "deepseek-v3",
-                "deepseek-r1"
-            ]
-
-            # Combine standard models with Ollama models
-            self._cached_models = standard_models + ollama_models
+            # Cache all models that the /model command can handle
+            self._cached_models = all_models
 
             # Create number mappings for models (1-based indexing)
+            # This matches the /model command numbering exactly
             self._cached_model_numbers = {}
             for i, model in enumerate(self._cached_models, 1):
                 self._cached_model_numbers[str(i)] = model
@@ -468,6 +520,158 @@ class FuzzyCommandCompleter(Completer):
 
         return suggestions
 
+    def get_agent_suggestions(self, current_word: str) -> List[Completion]:
+        """Get agent suggestions for the /agent command."""
+        suggestions = []
+
+        # Refresh agents if needed (non-blocking due to time-based caching)
+        self.fetch_all_agents()
+
+        # First try to complete agent numbers
+        for num, agent_name in self._cached_agent_numbers.items():
+            if num.startswith(current_word):
+                # Get agent display name for better UX
+                try:
+                    from cai.agents import get_available_agents
+                    agents = get_available_agents()
+                    agent_obj = agents.get(agent_name)
+                    display_name = getattr(agent_obj, "name", agent_name) if agent_obj else agent_name
+                except (ImportError, AttributeError, KeyError):  # pylint: disable=broad-except
+                    display_name = agent_name
+                    
+                suggestions.append(Completion(
+                    num,
+                    start_position=-len(current_word),
+                    display=HTML(
+                        f"<ansiwhite><b>{num:<3}</b></ansiwhite> "
+                        f"{display_name}"),
+                    style="fg:ansiwhite bold"
+                ))
+
+        # Then try to complete agent names
+        for agent_key in self._cached_agents:
+            if agent_key.startswith(current_word):
+                suggestions.append(Completion(
+                    agent_key,
+                    start_position=-len(current_word),
+                    display=HTML(
+                        f"<ansimagenta><b>{agent_key}</b></ansimagenta>"),
+                    style="fg:ansimagenta bold"
+                ))
+            elif (current_word.lower() in agent_key.lower() and
+                  not agent_key.startswith(current_word)):
+                suggestions.append(Completion(
+                    agent_key,
+                    start_position=-len(current_word),
+                    display=HTML(f"<ansimagenta>{agent_key}</ansimagenta>"),
+                    style="fg:ansimagenta"
+                ))
+
+        return suggestions
+
+    def get_mcp_server_suggestions(self, current_word: str) -> List[Completion]:
+        """Get MCP server name suggestions.
+        
+        Args:
+            current_word: The current word being typed
+            
+        Returns:
+            A list of completions for MCP servers
+        """
+        suggestions = []
+        
+        try:
+            # Import the global MCP servers registry
+            from cai.repl.commands.mcp import _GLOBAL_MCP_SERVERS
+            
+            # Get all active MCP server names
+            for server_name in _GLOBAL_MCP_SERVERS.keys():
+                # Get server type for display
+                server = _GLOBAL_MCP_SERVERS[server_name]
+                server_type = type(server).__name__.replace("MCPServer", "")
+                
+                # Exact prefix match
+                if server_name.startswith(current_word):
+                    suggestions.append(Completion(
+                        server_name,
+                        start_position=-len(current_word),
+                        display=HTML(
+                            f"<ansicyan><b>{server_name}</b></ansicyan> "
+                            f"<ansiwhite>({server_type})</ansiwhite>"),
+                        style="fg:ansicyan bold"
+                    ))
+                # Fuzzy match
+                elif (current_word.lower() in server_name.lower() and
+                      not server_name.startswith(current_word)):
+                    suggestions.append(Completion(
+                        server_name,
+                        start_position=-len(current_word),
+                        display=HTML(
+                            f"<ansicyan>{server_name}</ansicyan> "
+                            f"<ansiwhite>({server_type})</ansiwhite>"),
+                        style="fg:ansicyan"
+                    ))
+        except (ImportError, AttributeError):
+            pass  # No MCP servers available
+            
+        return suggestions
+
+    def get_mcp_suggestions(self, words: List[str], current_word: str) -> List[Completion]:
+        """Get context-aware MCP command completions.
+        
+        Args:
+            words: List of words including empty string if trailing space
+            current_word: The current word being typed (empty if trailing space)
+        
+        Returns:
+            List of completion suggestions
+        """
+        suggestions = []
+        
+        # Get the actual typed words (excluding empty strings from trailing spaces)
+        actual_words = [w for w in words if w]
+        
+        # Position 2: Completing subcommand (e.g., "/mcp <tab>")
+        # Use the default subcommand handler - no need to duplicate!
+        if len(words) == 2:
+            return self.get_subcommand_suggestions(words[0], current_word)
+        
+        # Position 3: After subcommand (e.g., "/mcp load <tab>")
+        elif len(words) == 3 and len(actual_words) > 1:
+            subcommand = actual_words[1]
+            
+            if subcommand == "load":
+                # Suggest transport types for load command
+                if not current_word.startswith("http"):  # Don't suggest if typing URL
+                    transports = [
+                        ("stdio", "Local process communication"),
+                        ("sse", "Server-Sent Events (HTTP)"),
+                    ]
+                    for transport, desc in transports:
+                        if transport.startswith(current_word):
+                            suggestions.append(Completion(
+                                transport,
+                                start_position=-len(current_word),
+                                display=HTML(
+                                    f"<ansiyellow><b>{transport}</b></ansiyellow> "
+                                    f"<ansiwhite>- {desc}</ansiwhite>"),
+                                style="fg:ansiyellow bold"
+                            ))
+                            
+            elif subcommand in ["add", "remove", "tools"]:
+                # These commands need an MCP server name
+                suggestions.extend(self.get_mcp_server_suggestions(current_word))
+        
+        # Position 4: After server name in add command (e.g., "/mcp add server <tab>")
+        elif len(words) == 4 and len(actual_words) > 1:
+            subcommand = actual_words[1]
+            
+            if subcommand == "add":
+                # After server name, suggest agent names
+                suggestions.extend(self.get_agent_suggestions(current_word))
+                
+        return suggestions
+
     # pylint: disable=unused-argument
     def get_completions(self, document, complete_event):
         """Get completions for the current document
@@ -480,11 +684,17 @@ class FuzzyCommandCompleter(Completer):
         Returns:
             A generator of completions
         """
-        text = document.text_before_cursor.strip()
+        # Keep original text to detect trailing spaces
+        text_original = document.text_before_cursor
+        text = text_original.strip()
         words = text.split()
+        
+        # Check if there's a trailing space (user finished typing a word)
+        has_trailing_space = text_original and text_original[-1] == ' '
 
-        # Refresh Ollama models periodically
-        self.fetch_ollama_models()
+        # Refresh Ollama models and agents periodically
+        self.fetch_all_models()
+        self.fetch_all_agents()
 
         if not text:
             # Show all main commands with descriptions
@@ -509,21 +719,54 @@ class FuzzyCommandCompleter(Completer):
             return
 
         if text.startswith('/'):
-            current_word = words[-1]
+            # Determine current word and effective word count based on trailing space
+            # Example: "/mcp " has trailing space, so current_word="" and we add empty string to words
+            # Example: "/mcp" has no trailing space, so current_word="/mcp" 
+            if has_trailing_space:
+                current_word = ""
+                effective_words = words + [""]  # Add empty string to represent new word position
+            else:
+                current_word = words[-1] if words else ""
+                effective_words = words
 
             # Main command completion (first word)
-            if len(words) == 1:
+            if len(effective_words) == 1 and not has_trailing_space:
                 # Get command suggestions
                 yield from self.get_command_suggestions(current_word)
 
             # Subcommand completion (second word)
-            elif len(words) == 2:
+            elif len(effective_words) == 2:
                 cmd = words[0]
 
                 # Special handling for model command
                 if cmd in ["/model", "/mod"]:
                     yield from self.get_model_suggestions(current_word)
+                # Add special handling for agent command
+                elif cmd in ["/agent", "/a"]:
+                    yield from self.get_agent_suggestions(current_word)
+                # Add special handling for MCP command
+                elif cmd in ["/mcp", "/m"]:
+                    yield from self.get_mcp_suggestions(effective_words, current_word)
                 else:
                     # Get subcommand suggestions
-                    yield from self.get_subcommand_suggestions(
-                        cmd, current_word)
+                    yield from self.get_subcommand_suggestions(cmd, current_word)
+
+            # Third word completion
+            elif len(effective_words) == 3:
+                cmd = words[0]
+                subcommand = words[1] if len(words) > 1 else ""
+                
+                # Agent select completion
+                if cmd in ["/agent", "/a"] and subcommand in ["select", "info"]:
+                    yield from self.get_agent_suggestions(current_word)
+                # MCP command completion for third word
+                elif cmd in ["/mcp", "/m"]:
+                    yield from self.get_mcp_suggestions(effective_words, current_word)
+            
+            # Fourth word completion (for MCP add command)
+            elif len(effective_words) == 4:
+                cmd = words[0]
+                
+                # MCP add command needs agent name as fourth word
+                if cmd in ["/mcp", "/m"]:
+                    yield from self.get_mcp_suggestions(effective_words, current_word)
