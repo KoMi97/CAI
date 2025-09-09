@@ -16,13 +16,15 @@ services:
       # Mount Docker socket to enable Docker-in-Docker
       - /var/run/docker.sock:/var/run/docker.sock
     command: /bin/sh -c "while sleep 10; do :; done"
-    networks:
-      cainet:
-        ipv4_address: 192.168.3.5
-    cap_add:
-      - NET_ADMIN
-      - SYS_ADMIN
-    privileged: true
+
+    network_mode: host
+    # networks:
+    #   cainet:
+    #     ipv4_address: 192.168.3.5
+    # cap_add:
+    #   - NET_ADMIN
+    #   - SYS_ADMIN
+    # privileged: true
 
   # # Vulnhub vulnerable machine (Hackable II) SUGGESTION: Comment this and use PentestPerf
   # hackableii:
